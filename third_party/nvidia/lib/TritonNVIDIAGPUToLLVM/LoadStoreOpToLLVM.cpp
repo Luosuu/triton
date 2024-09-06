@@ -166,6 +166,7 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         typeConverter->convertType(getElementTypeOrSelf(op.getType()));
     unsigned vec = getVectorSize(ptr);
     unsigned numElems = getTotalElemsPerThread(ptr.getType());
+    unsigned vecOrig = vec;
     if (llMask) {
       LLVM_DEBUG(DBGS() << "vec = " << vec
                         << " mask_alignment = " << getMaskAlignment(mask));
@@ -173,6 +174,13 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
       LLVM_DEBUG(llvm::dbgs() << " vec = " << vec << '\n');
     }
 
+    if (vec == 1 && numElems > 1) {
+      int maskValue = !llMask ? -1 : getMaskAlignment(mask);
+      op->emitRemark() << "Warning: vectorization fails vec = " << vec
+                       << " origin vec = " << vecOrig
+                       << " numElems = " << numElems << " mask is " << maskValue
+                       << "\n";
+    }
     // Get the LLVM values for pointers
     auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
     assert(ptrElems.size() == numElems);
@@ -266,9 +274,11 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
           PTXInstr::Operand *opr{};
 
           if (otherIsSplatConstInt) {
-            for (size_t s = 0; s < 32; s += valueElemNBits)
-              splatVal |= splatVal << valueElemNBits;
-            opr = ptxBuilder.newConstantOperand(splatVal);
+            int64_t replicatedSplatVal = 0;
+            for (size_t s = 0; s < movWidth; s += valueElemNBits) {
+              replicatedSplatVal |= splatVal << s;
+            }
+            opr = ptxBuilder.newConstantOperand(replicatedSplatVal);
           } else
             opr = ptxBuilder.newOperand(v, readConstraint);
 
@@ -380,6 +390,7 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     assert(ptrElems.size() == valueElems.size());
 
     // Determine the vectorization size
+    unsigned vecOrig = vec;
     SmallVector<Value> maskElems;
     if (llMask) {
       Value mask = op.getMask();
@@ -388,6 +399,14 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
 
       unsigned maskAlign = getMaskAlignment(mask);
       vec = std::min(vec, maskAlign);
+    }
+
+    if (vec == 1 && elemsPerThread > 1) {
+      int mask = !llMask ? -1 : getMaskAlignment(op.getMask());
+      op->emitRemark() << "Warning: vectorization fails vec = " << vec
+                       << " origin vec = " << vecOrig
+                       << " elemsPerThread = " << elemsPerThread << " mask is "
+                       << mask << "\n";
     }
 
     Value mask = redundantDataMask(valueTy, rewriter, loc, targetInfo);
@@ -518,11 +537,17 @@ struct AtomicCASOpConversion
     auto elemsPerThread = getTotalElemsPerThread(op.getVal().getType());
     // vec = 1 for scalar
     auto vec = getVectorSize(op.getPtr());
+    auto vecOrig = vec;
     // tensor
     if (tensorTy) {
       auto valTy = cast<RankedTensorType>(op.getVal().getType());
       vec = std::min<unsigned>(vec, valTy.getElementType().isF16() ? 2 : 1);
     }
+
+    if (vec == 1 && elemsPerThread > 1)
+      op->emitRemark() << "Warning: vectorization fails vec = " << vec
+                       << " origin vec = " << vecOrig
+                       << " elemsPerThread = " << elemsPerThread << "\n";
 
     Value mask = redundantDataMask(valueTy, rewriter, loc, targetInfo);
     auto vecTy = vec_ty(valueElemTy, vec);
@@ -641,6 +666,7 @@ struct AtomicRMWOpConversion
     auto elemsPerThread = getTotalElemsPerThread(val.getType());
     // vec = 1, numElements = 1 for scalar
     auto vec = getVectorSize(ptr);
+    auto vecOrig = vec;
     int numElems = 1;
     // tensor
     if (tensorTy) {
@@ -649,6 +675,12 @@ struct AtomicRMWOpConversion
       // mask
       numElems = tensorTy.getNumElements();
     }
+
+    if (vec == 1 && numElems > 1)
+      op->emitRemark() << "Warning: vectorization fails vec = " << vec
+                       << " origin vec = " << vecOrig
+                       << " numElems = " << numElems;
+
     Value mask = redundantDataMask(valueTy, rewriter, loc, targetInfo);
 
     auto vecTy = vec_ty(valueElemTy, vec);
