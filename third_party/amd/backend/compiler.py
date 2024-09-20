@@ -178,6 +178,8 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if use_new_pipeliner or options.num_stages != 0:
             amd.passes.ttgpuir.add_reorder_instructions(pm)
+        amd.passes.ttgpuir.add_canonicalize_pointers(pm)
+        passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod)
@@ -233,6 +235,7 @@ class HIPBackend(BaseBackend):
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
         amd.attach_target_triple(llvm_mod)
+        llvm.attach_datalayout(llvm_mod, amd.TARGET_TRIPLE, options.arch, '')
 
         # Set various control constants on the LLVM module so that device
         # libraries can resolve references to them.
