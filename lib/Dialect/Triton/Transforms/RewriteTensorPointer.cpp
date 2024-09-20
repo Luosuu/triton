@@ -1,9 +1,7 @@
 #include <memory>
 #include <stack>
 
-#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/Utility.h"
@@ -173,7 +171,10 @@ public:
     auto otherTensorType = RankedTensorType::get(tensorShape, elementType);
 
     // Set zero padding value
-    TypedAttr attr = builder.getZeroAttr(elementType);
+    TypedAttr attr =
+        elementType.isIntOrIndex()
+            ? cast<TypedAttr>(builder.getIntegerAttr(elementType, 0))
+            : cast<TypedAttr>(builder.getFloatAttr(elementType, 0));
 
     // Float NaN padding case
     if (padding.value() == triton::PaddingOption::PAD_NAN) {
@@ -208,20 +209,18 @@ public:
                        });
   }
 
-  static void generateNewOperands(SmallVector<Value> &oldOperands,
-                                  unsigned index, ArrayRef<Value> newValues) {
-    size_t size = oldOperands.size();
-    assert(index < size);
-    SmallVector<Value> operands = oldOperands;
-    oldOperands.reserve(size - 1 + newValues.size());
-    oldOperands.clear();
-    if (index != 0) {
-      oldOperands.append(operands.begin(), operands.begin() + index);
-    }
-    oldOperands.append(newValues.begin(), newValues.end());
-    if (index != size - 1) {
-      oldOperands.append(operands.begin() + index + 1, operands.end());
-    }
+  static SmallVector<Value>
+  generateNewOperands(const SmallVector<Value> &oldOperands, unsigned index,
+                      const SmallVector<Value> &newValues) {
+    assert(index < oldOperands.size());
+    SmallVector<Value> newOperands;
+    for (int i = 0; i < index; ++i)
+      newOperands.push_back(oldOperands[i]);
+    for (auto value : newValues)
+      newOperands.push_back(value);
+    for (auto i = index + 1; i < oldOperands.size(); ++i)
+      newOperands.push_back(oldOperands[i]);
+    return newOperands;
   }
 
   Operation *rewriteMakeTensorPtrOp(OpBuilder &builder,
@@ -359,7 +358,7 @@ public:
     }
     auto rematerialize = [&](Block *block) {
       for (Operation &opInIf : block->getOperations()) {
-        builder.clone(opInIf, mapping);
+        auto newOp = builder.clone(opInIf, mapping);
       }
     };
     builder.setInsertionPointToStart(newOp.thenBlock());
@@ -406,7 +405,8 @@ public:
       // Expand the tensor pointer into offsets
       assert(rewritedInfo.count(newIterOperands[i]));
       auto info = rewritedInfo[newIterOperands[i]];
-      generateNewOperands(newIterOperands, i, info.getOffsets());
+      newIterOperands =
+          generateNewOperands(newIterOperands, i, info.getOffsets());
       i += info.length() - 1;
       size += info.length() - 1;
     }
@@ -442,7 +442,9 @@ public:
     // Clone body
     builder.setInsertionPointToStart(newForOp.getBody());
     for (auto &opInFor : *op.getBody()) {
-      builder.clone(opInFor, mapping);
+      auto *newOp = builder.clone(opInFor, mapping);
+      for (unsigned i = 0; i < opInFor.getNumResults(); ++i)
+        mapping.map(opInFor.getResult(i), newOp->getResult(i));
     }
 
     // Replace later usages
@@ -477,7 +479,7 @@ public:
 
       assert(rewritedInfo.count(newOperands[i]));
       auto info = rewritedInfo[newOperands[i]];
-      generateNewOperands(newOperands, i, info.getOffsets());
+      newOperands = generateNewOperands(newOperands, i, info.getOffsets());
       i += info.length() - 1;
       size += info.length() - 1;
     }
@@ -493,13 +495,15 @@ public:
     // Rewrite `make_tensor_ptr` and `advance` and make a tensor of pointers
     // Rewriting functions return the next operation to visit, if there is no
     // next one, simply return `nullptr`
+    std::pair<Value, RewritedInfo> rewrited;
     if (auto makeTensorPtrOp = dyn_cast<triton::MakeTensorPtrOp>(op)) {
       return rewriteMakeTensorPtrOp(builder, makeTensorPtrOp, eraser);
     } else if (auto advanceOp = dyn_cast<triton::AdvanceOp>(op)) {
       return rewriteAdvanceOp(builder, advanceOp, eraser);
     } else if (isa<triton::LoadOp>(op) || isa<triton::StoreOp>(op)) {
       return rewriteLoadStoreOp(builder, op, eraser);
-    } else if (isa<scf::SCFDialect, cf::ControlFlowDialect>(op->getDialect())) {
+    } else if (op->getDialect()->getNamespace() == "scf" ||
+               op->getDialect()->getNamespace() == "cf") {
       if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
         return rewriteIfOp(builder, ifOp, eraser);
       }
@@ -523,12 +527,18 @@ public:
   }
 
   void visitOperation(Operation *op, std::stack<Operation *> &eraser) {
-    for (Region &region : op->getRegions()) {
-      for (Block &block : region) {
-        for (Operation &nestedOp : llvm::make_early_inc_range(block)) {
-          if (auto newOp = rewriteOp(&nestedOp, eraser)) {
+    for (auto &region : op->getRegions()) {
+      for (auto &block : region) {
+        // We need an extra copy because erasing operations may break the
+        // iterator behavior
+        SmallVector<Operation *> blockCopy;
+        for (auto &nestedOp : block)
+          blockCopy.push_back(&nestedOp);
+
+        // Rewrite and recursively visit
+        for (auto &nestedOp : blockCopy) {
+          if (auto newOp = rewriteOp(nestedOp, eraser))
             visitOperation(newOp, eraser);
-          }
         }
       }
     }

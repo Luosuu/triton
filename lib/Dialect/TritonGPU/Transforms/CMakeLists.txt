@@ -5,7 +5,6 @@ add_triton_library(TritonGPUTransforms
   CombineTensorSelectAndIf.cpp
   LoopScheduling.cpp
   ReduceDataDuplication.cpp
-  OptimizeAccumulatorInit.cpp
   OptimizeDotOperands.cpp
   OptimizeThreadLocality.cpp
   Pipeliner/MatmulLoopPipeline.cpp

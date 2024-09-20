@@ -348,7 +348,6 @@ public:
     auto opA = op.getOpA();
     auto opB = op.getOpB();
     auto opC = op.getOpC();
-    auto opScaleD = op.getUseC();
     auto typeA = opA.getType();
 
     auto structTypeA = dyn_cast<LLVM::LLVMStructType>(typeA);
@@ -365,11 +364,6 @@ public:
 
     // Operand B (must be `desc`)
     operandsAndConstraints.push_back({opB, "l"});
-
-    // `scale-d`
-    if (op.getOpC())
-      operandsAndConstraints.push_back({opScaleD, "b"});
-
     return operandsAndConstraints;
   }
 
@@ -466,11 +460,8 @@ public:
     // Operand B (must be `desc`)
     args += "$" + std::to_string(asmOpIdx++) + ", ";
 
-    // `scale-d`
-    if (op.getOpC())
-      args += "$" + std::to_string(asmOpIdx++);
-    else
-      args += "0";
+    // `scale-d` is 1 if we have a C operand.
+    args += op.getOpC() ? "1" : "0";
 
     // `imm-scale-a`, and `imm-scale-b` are 1 by default only for float-based
     // WGMMA
