@@ -412,7 +412,9 @@ class CompiledKernel:
         arg_idx = 0
         for i, arg_name in enumerate(self.src.fn.arg_names):
             if i in self.src.fn.constexprs:
-                arg_dict[arg_name] = self.src.constants[arg_name]
+                #TODO: double check whether this behavior is correct or not
+                arg_dict[arg_name] = self.src.constants[arg_idx]
+                arg_idx += 1
             else:
                 arg_dict[arg_name] = args[arg_idx]
                 arg_idx += 1
