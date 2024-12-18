@@ -5,16 +5,25 @@
 
 namespace proton {
 
+void ShadowContextSource::initializeThreadContext() {
+  if (!contextInitialized) {
+    threadContextStack = *mainContextStack;
+    contextInitialized = true;
+  }
+}
+
 void ShadowContextSource::enterScope(const Scope &scope) {
   if (!mainContextStack) {
     mainContextStack = &threadContextStack;
     contextInitialized = true;
   }
-  if (!contextInitialized && mainContextStack != &threadContextStack) {
-    threadContextStack = *mainContextStack;
-    contextInitialized = true;
-  }
+  initializeThreadContext();
   threadContextStack.push_back(scope);
+}
+
+std::vector<Context> ShadowContextSource::getContextsImpl() {
+  initializeThreadContext();
+  return threadContextStack;
 }
 
 void ShadowContextSource::exitScope(const Scope &scope) {
