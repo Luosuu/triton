@@ -406,6 +406,10 @@ def _raise_error(err, *args, **kwargs):
 
 class CompiledKernel:
 
+    # We prefer using each Triton function's launch_metadata function. However, if users cannot annotate functions
+    # (e.g., if they are generated automatically by TorchInductor), we can use a global hook to provide launch metadata
+    global_launch_metadata_hook = None
+
     def __init__(self, src, metadata_group, hash):
         from collections import namedtuple
         metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
@@ -484,10 +488,27 @@ class CompiledKernel:
             return None
         self._init_handles()
         ret = LazyDict({"name": self.name, "function": self.function, "stream": stream})
-        if not isinstance(self.src, ASTSource) or self.src.fn.launch_metadata is None:
+        if not isinstance(self.src, ASTSource):
             return ret
-        arg_dict = {name: arg for name, arg in zip(self.src.fn.arg_names, args)}
-        ret.add(self.src.fn.launch_metadata, (grid, self.metadata, arg_dict))
+        # Prioritize the launch metadata function from the function if it exists
+        # Otherwise we use the global hook
+        metadata_fn = self.src.fn.launch_metadata or CompiledKernel.global_launch_metadata_hook    
+        if metadata_fn is None:
+            return ret
+        constexpr_values = {
+            key[0]: value
+            for key, value in getattr(self.src, "constants", {}).items()
+            if isinstance(key, tuple) and len(key) == 1
+        }
+        args_iter = iter(args)
+        arg_dict = {}
+        constexpr_indices = set(getattr(self.src.fn, "constexprs", []))
+        for idx, arg_name in enumerate(self.src.fn.arg_names):
+            if idx in constexpr_indices:
+                arg_dict[arg_name] = constexpr_values.get(idx)
+            else:
+                arg_dict[arg_name] = next(args_iter)
+        ret.add(metadata_fn, (grid, self.metadata, arg_dict))
         return ret
 
     def __getitem__(self, grid):
