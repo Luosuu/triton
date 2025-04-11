@@ -39,6 +39,43 @@ std::shared_ptr<Metric> convertActivityToMetric(CUpti_Activity *activity) {
     } // else: not a valid kernel activity
     break;
   }
+  case CUPTI_ACTIVITY_KIND_MEMCPY:
+  case CUPTI_ACTIVITY_KIND_MEMCPY2: {
+    auto *memcpy = reinterpret_cast<CUpti_ActivityMemcpy *>(activity);
+    if (memcpy->start < memcpy->end) {
+      auto metric = std::make_shared<KernelMetric>(
+          static_cast<uint64_t>(memcpy->start),
+          static_cast<uint64_t>(memcpy->end), 1,
+          static_cast<uint64_t>(memcpy->deviceId),
+          static_cast<uint64_t>(DeviceType::CUDA));
+          
+      // Add bytes transferred as a metric
+      metric->setValue("bytes", memcpy->bytes);
+      
+      // Add direction information
+      std::string direction;
+      switch(memcpy->copyKind) {
+        case CUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
+          direction = "HostToDevice";
+          break;
+        case CUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
+          direction = "DeviceToHost";
+          break;
+        case CUPTI_ACTIVITY_MEMCPY_KIND_DTOD:
+          direction = "DeviceToDevice";
+          break;
+        case CUPTI_ACTIVITY_MEMCPY_KIND_HTOH:
+          direction = "HostToHost";
+          break;
+        default:
+          direction = "Unknown";
+      }
+      metric->setValue("direction", direction);
+      
+      return metric;
+    } // else: not a valid memcpy activity
+    break;
+  }
   default:
     break;
   }
@@ -89,6 +126,72 @@ processActivityKernel(CuptiProfiler::CorrIdToExternIdMap &corrIdToExternId,
   return correlationId;
 }
 
+// Helper function to process memory copy activities
+uint32_t processActivityMemcpy(CuptiProfiler::CorrIdToExternIdMap &corrIdToExternId,
+                              CuptiProfiler::ApiExternIdSet &apiExternIds,
+                              std::set<Data *> &dataSet, CUpti_Activity *activity) {
+  auto *memcpy = reinterpret_cast<CUpti_ActivityMemcpy *>(activity);
+  auto correlationId = memcpy->correlationId;
+  
+  if (!corrIdToExternId.contain(correlationId))
+    return correlationId;
+    
+  auto [parentId, numInstances] = corrIdToExternId.at(correlationId);
+  
+  // Create a metric for the memory copy operation
+  std::shared_ptr<Metric> metric;
+  if (memcpy->start < memcpy->end) {
+    // Determine the memory copy direction
+    std::string direction;
+    switch(memcpy->copyKind) {
+      case CUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
+        direction = "HostToDevice";
+        break;
+      case CUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
+        direction = "DeviceToHost";
+        break;
+      case CUPTI_ACTIVITY_MEMCPY_KIND_DTOD:
+        direction = "DeviceToDevice";
+        break;
+      case CUPTI_ACTIVITY_MEMCPY_KIND_HTOH:
+        direction = "HostToHost";
+        break;
+      default:
+        direction = "Unknown";
+    }
+    
+    // Create a memory copy metric with bytes transferred
+    metric = std::make_shared<KernelMetric>(
+        static_cast<uint64_t>(memcpy->start),
+        static_cast<uint64_t>(memcpy->end), 1,
+        static_cast<uint64_t>(memcpy->deviceId),
+        static_cast<uint64_t>(DeviceType::CUDA));
+        
+    // Set the bytes transferred
+    metric->setValue("bytes", memcpy->bytes);
+  }
+  
+  // Add the metric to all data sets
+  for (auto *data : dataSet) {
+    auto scopeId = parentId;
+    if (apiExternIds.contain(scopeId)) {
+      // It's triggered by a CUDA op but not triton op
+      scopeId = data->addOp(parentId, "cudaMemcpy");
+    }
+    data->addMetric(scopeId, metric);
+  }
+  
+  apiExternIds.erase(parentId);
+  --numInstances;
+  if (numInstances == 0) {
+    corrIdToExternId.erase(correlationId);
+  } else {
+    corrIdToExternId[correlationId].second = numInstances;
+  }
+  
+  return correlationId;
+}
+
 uint32_t processActivity(CuptiProfiler::CorrIdToExternIdMap &corrIdToExternId,
                          CuptiProfiler::ApiExternIdSet &apiExternIds,
                          std::set<Data *> &dataSet, CUpti_Activity *activity) {
@@ -98,6 +201,12 @@ uint32_t processActivity(CuptiProfiler::CorrIdToExternIdMap &corrIdToExternId,
   case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL: {
     correlationId = processActivityKernel(corrIdToExternId, apiExternIds,
                                           dataSet, activity);
+    break;
+  }
+  case CUPTI_ACTIVITY_KIND_MEMCPY:
+  case CUPTI_ACTIVITY_KIND_MEMCPY2: {
+    correlationId = processActivityMemcpy(corrIdToExternId, apiExternIds,
+                                         dataSet, activity);
     break;
   }
   default:
@@ -145,6 +254,34 @@ void setDriverCallbacks(CUpti_SubscriberHandle subscriber, bool enable) {
   CALLBACK_ENABLE(CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernelMultiDevice);
   CALLBACK_ENABLE(CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch);
   CALLBACK_ENABLE(CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
+#undef CALLBACK_ENABLE
+}
+
+void setMemcpyCallbacks(CUpti_SubscriberHandle subscriber, bool enable) {
+#define CALLBACK_ENABLE(id)                                                    \
+  cupti::enableCallback<true>(static_cast<uint32_t>(enable), subscriber,       \
+                              CUPTI_CB_DOMAIN_RUNTIME_API, id)
+
+  // Host to Device memory copies
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyAsync_v3020);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyHtoD_v3020);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyHtoDAsync_v3020);
+  
+  // Device to Host memory copies
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyDtoH_v3020);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyDtoHAsync_v3020);
+  
+  // Device to Device memory copies
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyDtoD_v3020);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyDtoDAsync_v3020);
+  
+  // New API versions
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v7000);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyAsync_v7000);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyToSymbol_v3020);
+  CALLBACK_ENABLE(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyFromSymbol_v3020);
+
 #undef CALLBACK_ENABLE
 }
 
@@ -378,9 +515,14 @@ void CuptiProfiler::CuptiProfilerPimpl::doStart() {
   } else {
     cupti::activityEnable<true>(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
   }
+  // Enable memory copy activity tracking
+  cupti::activityEnable<true>(CUPTI_ACTIVITY_KIND_MEMCPY);
+  cupti::activityEnable<true>(CUPTI_ACTIVITY_KIND_MEMCPY2);
+  
   cupti::activityRegisterCallbacks<true>(allocBuffer, completeBuffer);
   setGraphCallbacks(subscriber, /*enable=*/true);
   setRuntimeCallbacks(subscriber, /*enable=*/true);
+  setMemcpyCallbacks(subscriber, /*enable=*/true); // Add callbacks for memory operations
   setDriverCallbacks(subscriber, /*enable=*/true);
 }
 
@@ -422,8 +564,14 @@ void CuptiProfiler::CuptiProfilerPimpl::doStop() {
   } else {
     cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
   }
+  
+  // Disable memory copy activity tracking
+  cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_MEMCPY);
+  cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_MEMCPY2);
+  
   setGraphCallbacks(subscriber, /*enable=*/false);
   setRuntimeCallbacks(subscriber, /*enable=*/false);
+  setMemcpyCallbacks(subscriber, /*enable=*/false);
   setDriverCallbacks(subscriber, /*enable=*/false);
   cupti::unsubscribe<true>(subscriber);
   cupti::finalize<true>();
