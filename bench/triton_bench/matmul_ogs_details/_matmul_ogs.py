@@ -5,6 +5,30 @@ from triton_bench.mxfp import _unswizzle_mx_block
 from triton_bench.numerics import float_to_flex, load_scale, update_scale
 from ._common import make_matmul_repr, matmul_launch_metadata, swizzle2d, xcd_swizzle
 
+# -----------------------------------------------------------------------------
+# Standard Matrix Multiplication Kernel with Gather/Scatter for MoE
+# -----------------------------------------------------------------------------
+# This file implements the standard (non-persistent) kernel for matrix multiplication 
+# with gather/scatter operations used in Mixture of Experts (MoE) models.
+#
+# Key characteristics:
+# 1. Uses standard load/store operations with explicit memory management
+# 2. Works on a wider range of GPU hardware, including older devices
+# 3. Has higher kernel launch overhead but better compatibility
+# 4. Contains post-processing functions for scatter operations and split-K
+#
+# The main kernel (_matmul_ogs) handles:
+# - Token gathering from original positions to expert-specific positions
+# - Matrix multiplication for each expert
+# - Result scattering back to token positions or intermediate buffer
+# - Optional bias, scaling, and quantization operations
+#
+# Post-processing functions handle:
+# - _compute_writeback_idx: Indices for fused scatter operations
+# - _finalize_split_k: Combining partial results from split-K parallel reduction
+# - _matmul_postprocess: Combining expert outputs for each token
+# -----------------------------------------------------------------------------
+
 # fmt: off
 
 @triton.jit

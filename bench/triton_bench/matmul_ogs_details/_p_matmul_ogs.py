@@ -7,6 +7,31 @@ from triton_bench.mxfp import _unswizzle_mx_block
 from triton_bench.numerics import float_to_flex, load_scale, nan_propagating_absmax_reduce, compute_scale
 from ._common import make_matmul_repr, matmul_launch_metadata, swizzle2d, xcd_swizzle
 
+# -----------------------------------------------------------------------------
+# Persistent Matrix Multiplication Kernel with Gather/Scatter for MoE
+# -----------------------------------------------------------------------------
+# This file implements the persistent variant of the matrix multiplication kernel
+# with gather/scatter operations for Mixture of Experts (MoE) models.
+#
+# Key characteristics:
+# 1. Uses Tensor Memory Access (TMA) for efficient memory operations
+# 2. Requires newer NVIDIA GPUs (Hopper/Blackwell) with TMA support
+# 3. Maintains thread persistence for reduced launch overhead
+# 4. Achieves higher performance on supported hardware
+# 5. Optimized for quantized weights including microscaling (MX)
+#
+# Key components:
+# - _make_tensor_desc: Creates TMA descriptors for efficient memory access
+# - _p_matmul_ogs: Main kernel that performs persistent matrix multiplication
+# - get_per_device_per_stream_alloc_fn: Memory allocation for TMA descriptors
+#
+# Advantages over standard _matmul_ogs:
+# - Higher memory throughput via TMA
+# - Better GPU occupancy
+# - Lower kernel launch overhead
+# - More efficient for repeated computations on the same data
+# -----------------------------------------------------------------------------
+
 # fmt: off
 
 @triton.jit
