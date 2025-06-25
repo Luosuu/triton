@@ -166,7 +166,7 @@ Start a profiling session with specified configuration.
 **Parameters**:
 - `name` (str, optional): Profile name/path (default: "proton")
 - `context` (str): Context source type - "shadow" | "python" (default: "shadow")
-- `data` (str): Data structure type - "tree" (default: "tree")
+- `data` (str): Data structure type - "tree" (only supported option, provides hierarchical aggregation)
 - `backend` (str): Profiling backend - "cupti" | "cupti_pcsampling" | "roctracer" | None (auto-detect)
 - `hook` (str): Hook type - "triton" | None
 
@@ -1049,28 +1049,33 @@ with profiler.profile_phase("backward_pass"):
     loss.backward()
 ```
 
-#### Multi-GPU Profiling with Horovod
+#### Multi-GPU Profiling with PyTorch DDP
 
 ```python
 import proton
-import horovod.torch as hvd
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-# Initialize Horovod
-hvd.init()
-torch.cuda.set_device(hvd.local_rank())
+# Initialize distributed training
+dist.init_process_group(backend='nccl')
+rank = dist.get_rank()
+world_size = dist.get_world_size()
+torch.cuda.set_device(rank)
 
 # Create rank-specific profile
 session_id = proton.start(
-    f"horovod_profile_rank{hvd.rank()}_size{hvd.size()}",
+    f"ddp_profile_rank{rank}_size{world_size}",
     backend="cupti",
     hook="triton"
 )
 
 proton.activate(session_id)
 
-# Your distributed training code
+# Setup model with DDP
 model = MyModel().cuda()
-optimizer = hvd.DistributedOptimizer(optimizer)
+model = DDP(model, device_ids=[rank])
+optimizer = torch.optim.Adam(model.parameters())
 
 for epoch in range(num_epochs):
     with proton.scope(f"epoch_{epoch}"):
@@ -1078,10 +1083,88 @@ for epoch in range(num_epochs):
             with proton.scope(f"batch_{batch_idx}"):
                 # Training step
                 optimizer.zero_grad()
-                output = model(data)
-                loss = criterion(output, target)
+                output = model(data.cuda())
+                loss = criterion(output, target.cuda())
+                
+                # Profile backward pass separately
+                with proton.scope("backward"):
+                    loss.backward()
+                
+                # Profile optimizer step
+                with proton.scope("optimizer_step"):
+                    optimizer.step()
+
+proton.finalize(session_id)
+dist.destroy_process_group()
+```
+
+#### Multi-GPU Profiling with FSDP (Fully Sharded Data Parallel)
+
+```python
+import proton
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import wrap
+
+# Initialize distributed
+dist.init_process_group(backend='nccl')
+rank = dist.get_rank()
+world_size = dist.get_world_size()
+torch.cuda.set_device(rank)
+
+# Profile with different detail level for rank 0
+if rank == 0:
+    backend = "cupti_pcsampling"  # Detailed profiling on rank 0
+else:
+    backend = "cupti"  # Standard profiling on other ranks
+
+session_id = proton.start(
+    f"fsdp_profile_rank{rank}",
+    backend=backend,
+    hook="triton"
+)
+
+proton.activate(session_id)
+
+# Setup FSDP model
+model = MyLargeModel()
+model = FSDP(
+    model,
+    device_id=torch.cuda.current_device(),
+    auto_wrap_policy=wrap_policy,
+)
+
+optimizer = torch.optim.AdamW(model.parameters())
+
+# Training loop with profiling
+for epoch in range(num_epochs):
+    with proton.scope(f"epoch_{epoch}", {"rank": rank}):
+        for batch_idx, batch in enumerate(train_loader):
+            with proton.scope("data_loading"):
+                inputs = batch["input_ids"].cuda()
+                labels = batch["labels"].cuda()
+            
+            with proton.scope("forward", {"batch_size": len(inputs)}):
+                outputs = model(inputs)
+                loss = outputs.loss
+            
+            with proton.scope("backward"):
                 loss.backward()
+            
+            with proton.scope("optimizer_step"):
                 optimizer.step()
+                optimizer.zero_grad()
+            
+            # Profile FSDP communication
+            if batch_idx % 100 == 0:
+                with proton.scope("fsdp_stats"):
+                    # Log FSDP memory stats
+                    mem_stats = torch.cuda.memory_stats()
+                    proton.exit_scope(metrics={
+                        "peak_memory_gb": mem_stats["allocated_bytes.all.peak"] / 1e9,
+                        "current_memory_gb": torch.cuda.memory_allocated() / 1e9
+                    })
 
 proton.finalize(session_id)
 ```
@@ -1816,11 +1899,15 @@ except RuntimeError as e:
 
 1. **Output Formats**: Currently only supports Hatchet JSON format for output. Other formats may be added in future releases.
 
-2. **Chrome Trace Export**: While the codebase includes a `TraceData` class infrastructure, Chrome trace timeline export is not currently implemented. All methods in `TraceData` throw `NotImplemented()` exceptions.
+2. **No Timeline Tracing**: Proton currently only supports hierarchical tree-based profiling (`data="tree"`), which provides aggregated metrics but no timeline visualization. You cannot see the temporal ordering of events or create timeline traces like Chrome's trace viewer format.
 
-3. **Trace-based Data Collection**: The `data="trace"` option exists in the API but is not functional due to the unimplemented `TraceData` class.
+3. **Chrome Trace Export**: While the codebase includes a `TraceData` class infrastructure, Chrome trace timeline export is not currently implemented. All methods in `TraceData` throw `NotImplemented()` exceptions.
 
-4. **Limited Derived Metrics**: While many derived metrics are available, some advanced metrics may require manual calculation.
+4. **Trace-based Data Collection**: The `data="trace"` option exists in the API but is not functional due to the unimplemented `TraceData` class. Only `data="tree"` is supported.
+
+5. **Limited Derived Metrics**: While many derived metrics are available, some advanced metrics may require manual calculation.
+
+6. **No Event Timestamps**: The tree format aggregates all metrics, so you cannot see when specific events occurred during execution, only their total duration and count.
 
 ### Future Features
 
