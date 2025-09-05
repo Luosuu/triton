@@ -1,6 +1,6 @@
 import functools
 from typing import Dict, Optional, Union, Any
-
+import torch
 import triton
 from triton._C.libtriton import ir as triton_ir
 from triton._C.libtriton import proton as triton_proton
@@ -269,9 +269,18 @@ class InstrumentationHook(Hook):
         libproton.enter_instrumented_op(stream, func, self._data_ptr(), alloc_size)
         if InstrumentationHook.enable_host_buffer:
             InstrumentationHook.host_buffer = None
+        
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda._sleep(1_000_000)
+        self.start_event.record()
 
     def exit(self, metadata: LazyDict) -> None:
+        self.end_event.record()
+        torch.cuda.synchronize()
         func = metadata.data.get("function")
+        elapsed_time = self.start_event.elapsed_time(self.end_event)
+        print(f"Instrumentation elapsed time by cuda event: {elapsed_time} ms")
         stream = metadata.data.get("stream")
         alloc_size = 0 if self.buffer is None else self.buffer.element_size() * self.buffer.numel()
         libproton.exit_instrumented_op(stream, func, self._data_ptr(), alloc_size)
