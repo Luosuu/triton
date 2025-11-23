@@ -26,10 +26,7 @@ public:
   void exitScope(const Scope &scope) override;
 
 private:
-  std::vector<Context> getContextsImpl() override;
-
-  void initializeThreadContext();
-
+  std::vector<Context> getContextsImpl() override { return threadContextStack; }
   std::vector<Context> *mainContextStack{};
   static thread_local bool contextInitialized;
   static thread_local std::vector<Context> threadContextStack;
