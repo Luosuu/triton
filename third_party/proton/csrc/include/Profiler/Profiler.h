@@ -12,6 +12,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <vector>
 
 namespace proton {
 
@@ -26,9 +27,10 @@ public:
   /// Start the profiler.
   /// If the profiler is already started, this function does nothing.
   Profiler *start() {
-    if (this->initializedCount == 0)
+    if (!this->started) {
+      this->started = true;
       this->doStart();
-    this->initializedCount++;
+    }
     return this;
   }
 
@@ -40,12 +42,15 @@ public:
   }
 
   /// Stop the profiler.
+  /// Do real stop if there's no data to collect.
   Profiler *stop() {
-    if (this->initializedCount == 0)
+    if (!this->started) {
       return this;
-    this->initializedCount--;
-    if (this->initializedCount == 0)
+    }
+    if (this->getDataSet().empty()) {
+      this->started = false;
       this->doStop();
+    }
     return this;
   }
 
@@ -70,10 +75,23 @@ public:
     return dataSet;
   }
 
+  Profiler *setMode(const std::vector<std::string> &modeAndOptions) {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    this->modeAndOptions = modeAndOptions;
+    this->doSetMode(modeAndOptions);
+    return this;
+  }
+
+  std::vector<std::string> getMode() const {
+    std::shared_lock<std::shared_mutex> lock(mutex);
+    return modeAndOptions;
+  }
+
 protected:
   virtual void doStart() = 0;
   virtual void doFlush() = 0;
   virtual void doStop() = 0;
+  virtual void doSetMode(const std::vector<std::string> &modeAndOptions) = 0;
 
   // `dataSet` can be accessed by both the user thread and the background
   // threads
@@ -81,7 +99,8 @@ protected:
   std::set<Data *> dataSet;
 
 private:
-  int initializedCount{};
+  bool started{};
+  std::vector<std::string> modeAndOptions{};
 };
 
 } // namespace proton
